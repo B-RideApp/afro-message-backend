@@ -111,9 +111,9 @@ app.post("/send-otp", otpLimiter, async (req, res) => {
     });
 
     // Add sender name if available
-    if (senderName) {
-      queryParams.append('sender', senderName);
-    }
+    // if (senderName) {
+    //   queryParams.append('sender', senderName);
+    // }
 
     const apiUrl = `https://api.afromessage.com/api/challenge?${queryParams}`;
     console.log(`🔗 API URL: ${apiUrl}`);
