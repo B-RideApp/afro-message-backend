@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from "express";
 import fetch from "node-fetch";
 import rateLimit from "express-rate-limit";
@@ -27,24 +28,6 @@ const otpLimiter = rateLimit({
 
 app.use(express.json({ limit: '10mb' }));
 
-// Simple API key authentication
-const validateApiKey = (req, res, next) => {
-  const apiKey = req.headers['x-api-key'];
-  const validApiKey = process.env.BRIDE_API_KEY;
-  
-  if (!validApiKey) {
-    console.error('❌ BRIDE_API_KEY not configured');
-    return res.status(500).json({ error: "Server configuration error" });
-  }
-  
-  if (!apiKey || apiKey !== validApiKey) {
-    console.warn('⚠️ Unauthorized API access attempt');
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-  
-  next();
-};
-
 // Health check (no auth required)
 app.get("/", (req, res) => {
   res.json({
@@ -55,8 +38,8 @@ app.get("/", (req, res) => {
   });
 });
 
-// Health check with auth (for monitoring)
-app.get("/health", validateApiKey, (req, res) => {
+// Health check with details
+app.get("/health", (req, res) => {
   const afroToken = process.env.AFROMESSAGE_TOKEN;
   const afroId = process.env.AFROMESSAGE_IDENTIFIER_ID;
   
@@ -70,18 +53,14 @@ app.get("/health", validateApiKey, (req, res) => {
   });
 });
 
-// OTP endpoint with security
-app.post("/send-otp", otpLimiter, validateApiKey, async (req, res) => {
-  const { phone, otp } = req.body;
+// Send OTP endpoint
+app.post("/send-otp", otpLimiter, async (req, res) => {
+  const { phone, length = 6 } = req.body;
 
   // Input validation
-  if (!phone || !otp) {
+  if (!phone) {
     return res.status(400).json({ 
-      error: "Phone and OTP are required",
-      details: {
-        phone: !phone ? "Phone number is required" : null,
-        otp: !otp ? "OTP is required" : null
-      }
+      error: "Phone number is required"
     });
   }
 
@@ -94,17 +73,18 @@ app.post("/send-otp", otpLimiter, validateApiKey, async (req, res) => {
     });
   }
 
-  // Validate OTP format
-  if (!/^\d{4,8}$/.test(otp)) {
+  // Validate OTP length
+  if (length < 4 || length > 8) {
     return res.status(400).json({ 
-      error: "Invalid OTP format",
-      details: "OTP should be 4-8 digits"
+      error: "Invalid OTP length",
+      details: "OTP length should be between 4 and 8 digits"
     });
   }
 
   // Check environment variables
   const afroToken = process.env.AFROMESSAGE_TOKEN;
   const afroId = process.env.AFROMESSAGE_IDENTIFIER_ID;
+  const senderName = process.env.AFROMESSAGE_SENDER_NAME || '';
   
   if (!afroToken || !afroId) {
     console.error('❌ Missing AfroMessage credentials');
@@ -117,36 +97,67 @@ app.post("/send-otp", otpLimiter, validateApiKey, async (req, res) => {
   try {
     console.log(`📱 Sending OTP to ${phone.substring(0, 4)}****`);
     
-    const response = await fetch("https://api.afromessage.com/send", {
-      method: "POST",
+    // Build AfroMessage challenge API URL according to documentation
+    const queryParams = new URLSearchParams({
+      from: afroId,
+      to: phone,
+      len: length.toString(),
+      t: '0', // 0 for number only codes
+      pr: 'Your PedalFly verification code is ', // Message prefix
+      ps: '. This code expires in 10 minutes.', // Message postfix
+      sb: '0', // Spaces before code
+      sa: '0', // Spaces after code
+      ttl: '600' // 10 minutes expiration
+    });
+
+    // Add sender name if available
+    if (senderName) {
+      queryParams.append('sender', senderName);
+    }
+
+    const apiUrl = `https://api.afromessage.com/api/challenge?${queryParams}`;
+    console.log(`🔗 API URL: ${apiUrl}`);
+
+    const response = await fetch(apiUrl, {
+      method: "GET",
       headers: {
         "Authorization": `Bearer ${afroToken}`,
         "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        identifier: afroId,
-        to: phone,
-        message: `Your B-RIDE verification code is ${otp}. This code expires in 10 minutes.`
-      })
+      }
     });
 
-    const result = await response.json();
+    console.log(`📊 Response status: ${response.status}`);
     
-    if (!response.ok) {
+    let result;
+    try {
+      result = await response.json();
+    } catch (jsonError) {
+      const textResponse = await response.text();
+      console.error('❌ Non-JSON response:', textResponse.substring(0, 200));
+      throw new Error('Invalid API response format');
+    }
+    
+    console.log('📄 Response:', result);
+    
+    // Check if AfroMessage request was successful
+    if (result.acknowledge !== 'success') {
       console.error('❌ AfroMessage API error:', result);
-      return res.status(response.status).json({
+      return res.status(400).json({
         error: "Failed to send OTP",
-        details: result.message || "AfroMessage service error"
+        details: result.response || "AfroMessage service error"
       });
     }
 
     console.log(`✅ OTP sent successfully to ${phone.substring(0, 4)}****`);
+    console.log(`🔑 Generated OTP: ${result.response.code}`);
     
-    // Return success without exposing sensitive data
+    // Return success with the generated OTP and verification ID
     res.json({
       success: true,
       message: "OTP sent successfully",
-      messageId: result.messageId || result.id,
+      messageId: result.response.message_id,
+      otp: result.response.code, // The actual OTP code generated by AfroMessage
+      verificationId: result.response.verificationId, // For verification later
       timestamp: new Date().toISOString()
     });
     
@@ -154,6 +165,96 @@ app.post("/send-otp", otpLimiter, validateApiKey, async (req, res) => {
     console.error('❌ Error sending OTP:', err);
     res.status(500).json({ 
       error: "Failed to send OTP",
+      details: "Internal server error"
+    });
+  }
+});
+
+// Verify OTP endpoint (using AfroMessage verification)
+app.post("/verify-otp", async (req, res) => {
+  const { phone, code, verificationId } = req.body;
+
+  // Input validation
+  if (!phone || !code) {
+    return res.status(400).json({ 
+      error: "Phone number and code are required"
+    });
+  }
+
+  // Check environment variables
+  const afroToken = process.env.AFROMESSAGE_TOKEN;
+  
+  if (!afroToken) {
+    console.error('❌ Missing AfroMessage credentials');
+    return res.status(500).json({ 
+      error: "Server configuration error",
+      details: "AfroMessage credentials not configured"
+    });
+  }
+
+  try {
+    console.log(`🔍 Verifying OTP for ${phone.substring(0, 4)}****`);
+    
+    // Build AfroMessage verify API URL
+    const queryParams = new URLSearchParams({
+      to: phone,
+      code: code
+    });
+
+    // Add verification ID if available (more secure)
+    if (verificationId) {
+      queryParams.set('vc', verificationId);
+    }
+
+    const apiUrl = `https://api.afromessage.com/api/verify?${queryParams}`;
+    console.log(`🔗 Verify URL: ${apiUrl}`);
+
+    const response = await fetch(apiUrl, {
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${afroToken}`,
+        "Content-Type": "application/json"
+      }
+    });
+
+    console.log(`📊 Verify response status: ${response.status}`);
+    
+    let result;
+    try {
+      result = await response.json();
+    } catch (jsonError) {
+      const textResponse = await response.text();
+      console.error('❌ Non-JSON response:', textResponse.substring(0, 200));
+      throw new Error('Invalid API response format');
+    }
+    
+    console.log('📄 Verify response:', result);
+    
+    // Check if verification was successful
+    if (result.acknowledge === 'success') {
+      console.log(`✅ OTP verified successfully for ${phone.substring(0, 4)}****`);
+      
+      res.json({
+        success: true,
+        message: "OTP verified successfully",
+        phone: result.response.phone,
+        verificationId: result.response.verificationId,
+        timestamp: new Date().toISOString()
+      });
+    } else {
+      console.log(`❌ OTP verification failed for ${phone.substring(0, 4)}****`);
+      
+      res.status(400).json({
+        success: false,
+        error: "Invalid verification code",
+        details: result.response || "Code verification failed"
+      });
+    }
+    
+  } catch (err) {
+    console.error('❌ Error verifying OTP:', err);
+    res.status(500).json({ 
+      error: "Failed to verify OTP",
       details: "Internal server error"
     });
   }
@@ -181,6 +282,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 B-RIDE Backend running on port ${PORT}`);
   console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`🔑 API Key configured: ${process.env.BRIDE_API_KEY ? 'Yes' : 'No'}`);
   console.log(`📱 AfroMessage configured: ${process.env.AFROMESSAGE_TOKEN ? 'Yes' : 'No'}`);
 });
